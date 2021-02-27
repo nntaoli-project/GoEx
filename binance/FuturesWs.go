@@ -3,6 +3,7 @@ package binance
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/nntaoli-project/goex"
 	"github.com/nntaoli-project/goex/internal/logger"
 	"net/http"
@@ -28,7 +29,8 @@ func NewFuturesWs() *FuturesWs {
 
 	wsBuilder := goex.NewWsBuilder().
 		ProxyUrl(os.Getenv("HTTPS_PROXY")).
-		ProtoHandleFunc(futuresWs.handle).AutoReconnect()
+		ProtoHandleFunc(futuresWs.handle).AutoReconnect().
+		DecompressFunc(goex.GzipDecompress)
 	futuresWs.f = wsBuilder.WsUrl("wss://fstream.binance.com/ws").Build()
 	futuresWs.d = wsBuilder.WsUrl("wss://dstream.binance.com/ws").Build()
 
@@ -54,6 +56,36 @@ func NewFuturesWs() *FuturesWs {
 	return futuresWs
 }
 
+func NewWsByContractType(contractType string) *FuturesWs {
+	futuresWs := new(FuturesWs)
+
+	wsBuilder := goex.NewWsBuilder().
+		ProxyUrl(os.Getenv("HTTPS_PROXY")).
+		ProtoHandleFunc(futuresWs.handle).AutoReconnect().
+		DecompressFunc(goex.GzipDecompress)
+	switch contractType {
+	case goex.SWAP_USDT_CONTRACT:
+		futuresWs.f = wsBuilder.WsUrl("wss://fstream.binance.com/ws").Build()
+	case goex.SWAP_CONTRACT:
+		futuresWs.d = wsBuilder.WsUrl("wss://dstream.binance.com/ws").Build()
+	}
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	if len(os.Getenv("HTTPS_PROXY")) > 0 {
+		httpClient.Transport = &http.Transport{
+			Proxy: func(r *http.Request) (*url.URL, error) {
+				return url.Parse(os.Getenv("HTTPS_PROXY"))
+			},
+		}
+	}
+	futuresWs.base = NewBinanceFutures(&goex.APIConfig{
+		HttpClient: httpClient,
+	})
+
+	return futuresWs
+}
+
 func (s *FuturesWs) DepthCallback(f func(depth *goex.Depth)) {
 	s.depthCallFn = f
 }
@@ -67,24 +99,27 @@ func (s *FuturesWs) TradeCallback(f func(trade *goex.Trade, contract string)) {
 }
 
 func (s *FuturesWs) SubscribeDepth(pair goex.CurrencyPair, contractType string) error {
+	return s.SubscribeDepthArgs(pair, contractType, 10, 100)
+}
+func (s *FuturesWs) SubscribeDepthArgs(pair goex.CurrencyPair, contractType string, nums int, speed int) error {
+	numbsSpeedStr := fmt.Sprintf("@depth%d@%dms", nums, speed)
 	switch contractType {
 	case goex.SWAP_USDT_CONTRACT:
 		return s.f.Subscribe(req{
 			Method: "SUBSCRIBE",
-			Params: []string{pair.AdaptUsdToUsdt().ToLower().ToSymbol("") + "@depth10@100ms"},
+			Params: []string{pair.AdaptUsdToUsdt().ToLower().ToSymbol("") + numbsSpeedStr},
 			Id:     1,
 		})
 	default:
 		sym, _ := s.base.adaptToSymbol(pair.AdaptUsdtToUsd(), contractType)
 		return s.d.Subscribe(req{
 			Method: "SUBSCRIBE",
-			Params: []string{strings.ToLower(sym) + "@depth10@100ms"},
+			Params: []string{strings.ToLower(sym) + numbsSpeedStr},
 			Id:     2,
 		})
 	}
 	return errors.New("contract is error")
 }
-
 func (s *FuturesWs) SubscribeTicker(pair goex.CurrencyPair, contractType string) error {
 	switch contractType {
 	case goex.SWAP_USDT_CONTRACT:
@@ -105,7 +140,22 @@ func (s *FuturesWs) SubscribeTicker(pair goex.CurrencyPair, contractType string)
 }
 
 func (s *FuturesWs) SubscribeTrade(pair goex.CurrencyPair, contractType string) error {
-	panic("implement me")
+	switch contractType {
+	case goex.SWAP_USDT_CONTRACT:
+		return s.f.Subscribe(req{
+			Method: "SUBSCRIBE",
+			Params: []string{pair.AdaptUsdToUsdt().ToLower().ToSymbol("") + "@aggTrade"},
+			Id:     1,
+		})
+	case goex.SWAP_CONTRACT:
+		sym, _ := s.base.adaptToSymbol(pair.AdaptUsdtToUsd(), contractType)
+		return s.d.Subscribe(req{
+			Method: "SUBSCRIBE",
+			Params: []string{strings.ToLower(sym) + "@ticker"},
+			Id:     2,
+		})
+	}
+	return errors.New("contract is error")
 }
 
 func (s *FuturesWs) handle(data []byte) error {
@@ -134,6 +184,11 @@ func (s *FuturesWs) handle(data []byte) error {
 
 	if e, ok := m["e"].(string); ok && e == "24hrTicker" {
 		s.tickerCallFn(s.tickerHandle(m))
+		return nil
+	}
+
+	if e, ok := m["e"].(string); ok && e == "aggTrade" {
+		s.tradeCalFn(s.tradeHandle(m), "没有类型，注意****")
 		return nil
 	}
 
@@ -186,4 +241,24 @@ func (s *FuturesWs) tickerHandle(m map[string]interface{}) *goex.FutureTicker {
 	ticker.Vol = goex.ToFloat64(m["v"])
 
 	return &ticker
+}
+
+func (s *FuturesWs) tradeHandle(m map[string]interface{}) *goex.Trade {
+	var trade goex.Trade
+	symbol, ok := m["ps"].(string)
+	if ok {
+		trade.Pair = adaptSymbolToCurrencyPair(symbol)
+	} else {
+		trade.Pair = adaptSymbolToCurrencyPair(m["s"].(string)) //usdt swap
+	}
+	trade.Date = goex.ToInt64(m["T"])
+	trade.Tid = goex.ToInt64(m["a"])
+	trade.Price = goex.ToFloat64(m["p"])
+	trade.Amount = goex.ToFloat64(m["q"])
+	trade.Type = goex.BUY
+	if !m["m"].(bool) {
+		trade.Type = goex.SELL
+	}
+
+	return &trade
 }
